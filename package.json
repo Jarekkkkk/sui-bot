@@ -1,0 +1,24 @@
+{
+  "name": "trading-bot",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@7kprotocol/sdk-ts": "^2.2.0",
+    "@cetusprotocol/aggregator-sdk": "^0.3.12",
+    "@cetusprotocol/cetus-sui-clmm-sdk": "^5.1.10",
+    "@mysten/sui": "^1.17.0",
+    "@pythnetwork/pyth-sui-js": "^2.1.0",
+    "@suilend/sdk": "^1.1.25",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.7",
+    "hot-shots": "^10.2.1",
+    "tslib": "^2.8.1",
+    "tslog": "^4.9.3"
+  }
+}
