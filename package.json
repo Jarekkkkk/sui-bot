@@ -16,6 +16,7 @@
     "@pythnetwork/pyth-sui-js": "^2.1.0",
     "@suilend/sdk": "^1.1.25",
     "commander": "^12.1.0",
+    "decimal.js": "^10.4.3",
     "dotenv": "^16.4.7",
     "hot-shots": "^10.2.1",
     "tslib": "^2.8.1",

@@ -1,9 +1,13 @@
 import CetusClmmSDK, {
   type AddLiquidityFixTokenParams,
+  adjustForCoinSlippage,
   ClmmPoolUtil,
+  normalizeCoinType,
+  Percentage,
   type SdkOptions,
   TickMath,
   TransactionUtil,
+  ZERO,
 } from "@cetusprotocol/cetus-sui-clmm-sdk";
 import { SuiClient } from "@mysten/sui/client";
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
@@ -17,12 +21,16 @@ import { type SwapArgs, type Swapper } from "../index";
 
 import { MAINNET_POOL_INFO_URL } from "./configs";
 import { logger } from "../../logger";
-import { buildTx } from "@7kprotocol/sdk-ts";
+import { buildTx, type Coin } from "@7kprotocol/sdk-ts";
 import {
   AggregatorClient,
   type RouterData,
 } from "@cetusprotocol/aggregator-sdk";
 import { getInputCoins } from "../../lib";
+import Decimal from "decimal.js";
+import { COIN_DECIMALS, COIN_TYPE_LIST } from "../../const";
+import type { COIN } from "../../../type";
+import { normalizeStructTag } from "@mysten/sui/utils";
 
 export type CetusConstructorArgs = {
   keypair: Ed25519Keypair | Secp256k1Keypair;
@@ -78,6 +86,54 @@ export class CetusSwapper implements Swapper {
   async init() {
     // await this.refreshPoolInfo();
     this.sdk.senderAddress = this.keypair.toSuiAddress();
+  }
+
+  async fetchLPPositions(positionId: string) {
+    const position = await this.sdk.Position.getSimplePosition(positionId);
+    logger.info({ position });
+    const pool_id = position.pool;
+    const pool = await this.sdk.Pool.getPool(pool_id);
+    const coinA = Object.keys(COIN_TYPE_LIST).find(
+      (symbol) =>
+        normalizeStructTag(COIN_TYPE_LIST[symbol as COIN]) ==
+        normalizeStructTag(position.coin_type_a),
+    );
+    const coinB = Object.keys(COIN_TYPE_LIST).find(
+      (symbol) =>
+        normalizeStructTag(COIN_TYPE_LIST[symbol as COIN]) ==
+        normalizeStructTag(position.coin_type_b),
+    );
+
+    if (!coinA || !coinB) throw "Not supported Coin Type";
+
+    const liquidity = new BN(position.liquidity);
+    const curSqrtPrice = new BN(pool.current_sqrt_price);
+
+    const lowerSqrtPrice = TickMath.tickIndexToSqrtPriceX64(
+      position.tick_lower_index,
+    );
+    const upperSqrtPrice = TickMath.tickIndexToSqrtPriceX64(
+      position.tick_upper_index,
+    );
+
+    const amounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
+      liquidity,
+      curSqrtPrice,
+      lowerSqrtPrice,
+      upperSqrtPrice,
+      false,
+    );
+
+    const liquidityInfo = {
+      coinA,
+      coinB,
+      coinAAmount: amounts.coinA.toString(),
+      coinBAmount: amounts.coinB.toString(),
+    };
+
+    logger.info({ liquidityInfo });
+
+    return liquidityInfo;
   }
 
   // TODO
@@ -136,20 +192,50 @@ export class CetusSwapper implements Swapper {
     );
   }
 
-  async createPosition(poolObjectId: string) {
+  async createPosition(
+    poolObjectId: string,
+    lowerPrice: number,
+    upperPrice: number,
+    coinAmountA: number,
+  ) {
     // get Pool info
     const pool = await this.sdk.Pool.getPool(poolObjectId);
     logger.info({ pool });
-    // get ticks
-    const lowerTick = TickMath.getPrevInitializableTickIndex(
-      new BN(pool.current_tick_index).toNumber(),
-      new BN(pool.tickSpacing).toNumber(),
+
+    // convert ticks
+    const coinA = Object.keys(COIN_TYPE_LIST).find(
+      (coin_symbol) => COIN_TYPE_LIST[coin_symbol as COIN] == pool.coinTypeA,
+    ) as COIN;
+    const coinB = Object.keys(COIN_TYPE_LIST).find(
+      (coin_symbol) => COIN_TYPE_LIST[coin_symbol as COIN] == pool.coinTypeB,
+    ) as COIN;
+
+    if (!coinA || !coinB) throw "Failed to get coin value from pool";
+
+    const lowerTick_ = TickMath.priceToInitializableTickIndex(
+      new Decimal(lowerPrice),
+      COIN_DECIMALS[coinA],
+      COIN_DECIMALS[coinB],
+      Number(pool.tickSpacing),
     );
-    const upperTick = TickMath.getNextInitializableTickIndex(
-      new BN(pool.current_tick_index).toNumber(),
-      new BN(pool.tickSpacing).toNumber(),
+    const upperTick_ = TickMath.priceToInitializableTickIndex(
+      new Decimal(upperPrice),
+      COIN_DECIMALS[coinA],
+      COIN_DECIMALS[coinB],
+      Number(pool.tickSpacing),
     );
-    const coinAmount = new BN(100);
+
+    const isCorrectOrer = lowerTick_ < upperTick_;
+    const lowerTick = isCorrectOrer ? lowerTick_ : upperTick_;
+    const upperTick = isCorrectOrer ? upperTick_ : lowerTick_;
+    logger.info({
+      lowerPrice,
+      upperPrice,
+      lowerTick,
+      upperTick,
+    });
+
+    const coinAmount = new BN(coinAmountA);
     const fix_amount_a = true;
     const slippage = 0.01;
     const curSqrtPrice = new BN(pool.current_sqrt_price);
@@ -165,7 +251,20 @@ export class CetusSwapper implements Swapper {
       curSqrtPrice,
     );
 
-    logger.info({ liquidityInput });
+    logger.info({
+      coinAmountA: liquidityInput.coinAmountA.toString(),
+      coinAmountB: liquidityInput.coinAmountB.toString(),
+      tokenMaxA: liquidityInput.tokenMaxA.toString(),
+      tokenMaxB: liquidityInput.tokenMaxB.toString(),
+      liquidityAmount: liquidityInput.liquidityAmount.toString(),
+      fix_amount_a: liquidityInput.fix_amount_a,
+    });
+
+    if (
+      liquidityInput.coinAmountA.toNumber() == 0 ||
+      liquidityInput.coinAmountB.toNumber() == 0
+    )
+      throw "failed to open valid position. one side of liquidity is empty";
 
     const amount_a = fix_amount_a
       ? coinAmount.toNumber()
@@ -198,6 +297,66 @@ export class CetusSwapper implements Swapper {
         curSqrtPrice,
       },
     );
+  }
+
+  async closePosition(positionId: string) {
+    const position = await this.sdk.Position.getSimplePosition(positionId);
+    const pool = await this.sdk.Pool.getPool(position.pool);
+    // build tick data
+    const lowerSqrtPrice = TickMath.tickIndexToSqrtPriceX64(
+      position.tick_lower_index,
+    );
+    const upperSqrtPrice = TickMath.tickIndexToSqrtPriceX64(
+      position.tick_upper_index,
+    );
+    const ticksHandle = pool.ticks_handle;
+    const tickLower = await this.sdk.Pool.getTickDataByIndex(
+      ticksHandle,
+      position.tick_lower_index,
+    );
+    const tickUpper = await this.sdk.Pool.getTickDataByIndex(
+      ticksHandle,
+      position.tick_upper_index,
+    );
+    // input liquidity amount for remove
+    const liquidity = new BN(position.liquidity);
+    // slippage value
+    const slippageTolerance = new Percentage(new BN(5), new BN(100));
+    const curSqrtPrice = new BN(pool.current_sqrt_price);
+    // Get token amount from liquidity.
+    const coinAmounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
+      liquidity,
+      curSqrtPrice,
+      lowerSqrtPrice,
+      upperSqrtPrice,
+      false,
+    );
+    // adjust token a and token b amount for slippage
+    const { tokenMaxA, tokenMaxB } = adjustForCoinSlippage(
+      coinAmounts,
+      slippageTolerance,
+      false,
+    );
+    // get all rewarders of position
+    const rewards: any[] = await this.sdk.Rewarder.posRewardersAmount(
+      position.pool,
+      pool.position_manager.positions_handle,
+      positionId,
+    );
+    const rewardCoinTypes = rewards
+      .filter((item) => Number(item.amount_owed) > 0)
+      .map((item) => item.coin_address);
+    // build close position payload
+    return await this.sdk.Position.closePositionTransactionPayload({
+      coinTypeA: pool.coinTypeA,
+      coinTypeB: pool.coinTypeB,
+      min_amount_a: tokenMaxA.toString(),
+      min_amount_b: tokenMaxB.toString(),
+      rewarder_coin_types: [...rewardCoinTypes],
+      pool_id: pool.poolAddress,
+      pos_id: positionId,
+      collect_fee: true,
+    });
   }
 
   async quoteRouter(args: SwapArgs): Promise<RouterData | null> {

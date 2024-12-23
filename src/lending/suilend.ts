@@ -18,11 +18,15 @@ import { logger } from "../logger";
 import { StatsD } from "hot-shots";
 import { LendingMarket } from "@suilend/sdk/_generated/suilend/lending-market/structs";
 import { phantom } from "@suilend/sdk/_generated/_framework/reified";
-import { getCoinMetadataMap } from "../lib";
+import { getCoinMetadataMap, getInputCoins } from "../lib";
 import { normalizeStructTag, SUI_TYPE_ARG } from "@mysten/sui/utils";
 import { borrowLimit } from "@suilend/sdk/_generated/suilend/reserve-config/functions";
 import { COIN_DECIMALS, COIN_TYPE_LIST } from "../const";
-import { Transaction } from "@mysten/sui/transactions";
+import {
+  Transaction,
+  type TransactionObjectInput,
+} from "@mysten/sui/transactions";
+import { obligationId } from "@suilend/sdk/_generated/suilend/lending-market/functions";
 
 export type SuilendBotConfig = {
   keypair: Ed25519Keypair | Secp256k1Keypair;
@@ -54,6 +58,33 @@ export class SuilendBot {
       "https://hermes.pyth.network",
     );
     this.statsd = new StatsD({ mock: true });
+  }
+
+  deposit_(
+    tx: Transaction,
+    obligation: TransactionObjectInput,
+    coin: TransactionObjectInput,
+    coinType: string,
+  ) {
+    if (!this.suilend) throw "Suilend client not setup";
+    this.suilend.deposit(coin, coinType, obligation, tx);
+  }
+
+  async borrow_(
+    tx: Transaction,
+    obligationOwnerCapId: string,
+    obligationId: string,
+    coinType: string,
+    value: BigInt,
+  ) {
+    if (!this.suilend) throw "Suilend client not setup";
+    return await this.suilend.borrow(
+      obligationOwnerCapId,
+      obligationId,
+      coinType,
+      value.toString(),
+      tx,
+    );
   }
 
   async run() {
@@ -118,6 +149,7 @@ export class SuilendBot {
     );
 
     if (obligationOwnerCaps.length == 0) throw "No obligations found";
+    const obligationOwnerCap = obligationOwnerCaps[0];
     const obligations = (
       await Promise.all(
         this.obligationList.map((obligationId) =>
@@ -154,6 +186,39 @@ export class SuilendBot {
       borrowLimit: obligation.borrowLimit.toNumber(),
       minPriceBorrowLimitUsd: obligation.minPriceBorrowLimitUsd.toNumber(),
     });
+
+    const tx = new Transaction();
+
+    // deposit
+    // const coin = await getInputCoins(
+    //   tx,
+    //   this.suiClient,
+    //   this.keypair.toSuiAddress(),
+    //   COIN_TYPE_LIST.SUI,
+    //   (10 ** 8).toString(),
+    // );
+    // this.deposit_(
+    //   tx,
+    //   tx.object(obligationOwnerCap.id),
+    //   coin,
+    //   COIN_TYPE_LIST.SUI,
+    // );
+
+    const coin = await this.borrow_(
+      tx,
+      obligationOwnerCap.id,
+      obligation.id,
+      COIN_TYPE_LIST.USDC,
+      BigInt(10 ** 5),
+    );
+    tx.transferObjects([coin], this.keypair.toSuiAddress());
+
+    const devResponse = await this.dryRun(tx);
+    logger.debug({ devResponse });
+
+    if (devResponse.effects.status.status === "success") {
+      await this.executeTransaction(tx);
+    }
   }
 
   async dryRun(tx: Transaction) {
