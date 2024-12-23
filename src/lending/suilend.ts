@@ -16,22 +16,28 @@ import { SuiPriceServiceConnection } from "@pythnetwork/pyth-sui-js";
 import { SuiClient } from "@mysten/sui/client";
 import { logger } from "../logger";
 import { StatsD } from "hot-shots";
-import { LendingMarket } from "@suilend/sdk/_generated/suilend/lending-market/structs";
+import {
+  LendingMarket,
+  ObligationOwnerCap,
+} from "@suilend/sdk/_generated/suilend/lending-market/structs";
 import { phantom } from "@suilend/sdk/_generated/_framework/reified";
 import { getCoinMetadataMap, getInputCoins } from "../lib";
 import { normalizeStructTag, SUI_TYPE_ARG } from "@mysten/sui/utils";
 import { borrowLimit } from "@suilend/sdk/_generated/suilend/reserve-config/functions";
-import { COIN_DECIMALS, COIN_TYPE_LIST } from "../const";
+import { COIN_DECIMALS, COIN_TYPE_LIST, STABLE_COIN_TYPES } from "../const";
 import {
   Transaction,
   type TransactionObjectInput,
 } from "@mysten/sui/transactions";
 import { obligationId } from "@suilend/sdk/_generated/suilend/lending-market/functions";
+import type { Obligation } from "@suilend/sdk/_generated/suilend/obligation/structs";
+import type { SuilendObligation } from "../../type";
+import type { CetusSwapper } from "../swappers/cetus";
 
 export type SuilendBotConfig = {
   keypair: Ed25519Keypair | Secp256k1Keypair;
   rpcURL: string;
-  swapper: Swapper;
+  swapper: CetusSwapper;
   lendingMarketType: string;
   marketAddress: string;
   pollingIntervalSeconds: number;
@@ -44,10 +50,12 @@ export class SuilendBot {
   keypair: Ed25519Keypair | Secp256k1Keypair;
   obligationList: string[] = [];
   suiClient: SuiClient;
-  swapper: Swapper;
+  swapper: CetusSwapper;
   suilend?: SuilendClient;
   pythConnection: SuiPriceServiceConnection;
   statsd: StatsD;
+  obligationOwnerCap?: ObligationOwnerCap<string>;
+  obligation?: SuilendObligation | null;
 
   constructor(config: SuilendBotConfig) {
     this.config = config;
@@ -60,34 +68,7 @@ export class SuilendBot {
     this.statsd = new StatsD({ mock: true });
   }
 
-  deposit_(
-    tx: Transaction,
-    obligation: TransactionObjectInput,
-    coin: TransactionObjectInput,
-    coinType: string,
-  ) {
-    if (!this.suilend) throw "Suilend client not setup";
-    this.suilend.deposit(coin, coinType, obligation, tx);
-  }
-
-  async borrow_(
-    tx: Transaction,
-    obligationOwnerCapId: string,
-    obligationId: string,
-    coinType: string,
-    value: BigInt,
-  ) {
-    if (!this.suilend) throw "Suilend client not setup";
-    return await this.suilend.borrow(
-      obligationOwnerCapId,
-      obligationId,
-      coinType,
-      value.toString(),
-      tx,
-    );
-  }
-
-  async run() {
+  async setup() {
     this.suilend = await SuilendClient.initialize(
       this.config.marketAddress,
       this.config.lendingMarketType,
@@ -149,7 +130,7 @@ export class SuilendBot {
     );
 
     if (obligationOwnerCaps.length == 0) throw "No obligations found";
-    const obligationOwnerCap = obligationOwnerCaps[0];
+    this.obligationOwnerCap = obligationOwnerCaps[0];
     const obligations = (
       await Promise.all(
         this.obligationList.map((obligationId) =>
@@ -166,59 +147,90 @@ export class SuilendBot {
       // Descending order by position value
       .sort((a, b) => b.netValueUsd.toNumber() - a.netValueUsd.toNumber());
 
-    const obligation = obligations[0];
+    this.obligation = obligations[0];
+  }
 
-    // parse obligation information
-    const deposits = obligation.deposits.map((deposit) => ({
-      coinType: deposit.coinType,
-      amount: deposit.depositedAmount.toNumber(),
-    }));
-    const borrows = obligation.borrows.map((borrow) => ({
-      coinType: borrow.coinType,
-      amount: borrow.borrowedAmount.toNumber(),
-    }));
+  async run() {
+    await this.setup();
+    if (!this.suilend || !this.obligationOwnerCap || !this.obligation)
+      throw "Suilend not setup";
 
-    logger.info({
-      totalDepositUsd: obligation.depositedAmountUsd.toNumber(),
-      totalBorrowUsd: obligation.borrowedAmountUsd.toNumber(),
-      deposits,
-      borrows,
-      borrowLimit: obligation.borrowLimit.toNumber(),
-      minPriceBorrowLimitUsd: obligation.minPriceBorrowLimitUsd.toNumber(),
-    });
-
-    const tx = new Transaction();
-
-    // deposit
-    // const coin = await getInputCoins(
-    //   tx,
-    //   this.suiClient,
-    //   this.keypair.toSuiAddress(),
-    //   COIN_TYPE_LIST.SUI,
-    //   (10 ** 8).toString(),
-    // );
-    // this.deposit_(
-    //   tx,
-    //   tx.object(obligationOwnerCap.id),
-    //   coin,
-    //   COIN_TYPE_LIST.SUI,
-    // );
-
-    const coin = await this.borrow_(
-      tx,
-      obligationOwnerCap.id,
-      obligation.id,
-      COIN_TYPE_LIST.USDC,
-      BigInt(10 ** 5),
+    const liquidityInfo = await this.swapper.fetchLPPositions(
+      "0x30b7881f9b24d9ed2507604d911dd73e430462d6eafb0918f061fc65551ffefe",
     );
-    tx.transferObjects([coin], this.keypair.toSuiAddress());
 
-    const devResponse = await this.dryRun(tx);
-    logger.debug({ devResponse });
+    if (
+      liquidityInfo.coinAAmount === "0" ||
+      liquidityInfo.coinBAmount === "0"
+    ) {
+      throw "LP position leave range";
+      // TODO: repay all the assets in suilend to offset the debt
+    } else {
+      const isCoinAStable = STABLE_COIN_TYPES.includes(
+        liquidityInfo.coinA as any,
+      );
+      const isCoinBStable = STABLE_COIN_TYPES.includes(
+        liquidityInfo.coinB as any,
+      );
 
-    if (devResponse.effects.status.status === "success") {
-      await this.executeTransaction(tx);
+      if (!isCoinAStable && !isCoinBStable) throw "Unsupported LP position";
+      if (isCoinAStable && isCoinBStable) throw "Stable LP position";
+
+      const hedgedAssetType = isCoinAStable
+        ? liquidityInfo.coinB
+        : liquidityInfo.coinA;
+
+      // parse obligation
+      const deposits = this.obligation.deposits.map((deposit) => ({
+        coinType: deposit.coinType,
+        amount: deposit.depositedAmount.toNumber(),
+      }));
+      const borrows = this.obligation.borrows.map((borrow) => ({
+        coinType: borrow.coinType,
+        amount: borrow.borrowedAmount.toNumber(),
+      }));
+      const liquidationThresholdUsd =
+        this.obligation.unhealthyBorrowValueUsd.toNumber();
+      const borrowLimitUsd = this.obligation.borrowLimitUsd.toNumber();
+
+      logger.info({
+        totalDepositUsd: this.obligation.depositedAmountUsd.toNumber(),
+        totalBorrowUsd: this.obligation.borrowedAmountUsd.toNumber(),
+        positionNetUsd: this.obligation.netValueUsd.toNumber(),
+        deposits,
+        borrows,
+        liquidationThresholdUsd,
+        borrowLimitUsd,
+      });
     }
+  }
+
+  // PTB
+  deposit_(
+    tx: Transaction,
+    obligation: TransactionObjectInput,
+    coin: TransactionObjectInput,
+    coinType: string,
+  ) {
+    if (!this.suilend) throw "Suilend client not setup";
+    this.suilend.deposit(coin, coinType, obligation, tx);
+  }
+
+  async borrow_(
+    tx: Transaction,
+    obligationOwnerCapId: string,
+    obligationId: string,
+    coinType: string,
+    value: BigInt,
+  ) {
+    if (!this.suilend) throw "Suilend client not setup";
+    return await this.suilend.borrow(
+      obligationOwnerCapId,
+      obligationId,
+      coinType,
+      value.toString(),
+      tx,
+    );
   }
 
   async dryRun(tx: Transaction) {

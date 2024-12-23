@@ -34,3 +34,13 @@ export const COIN_DECIMALS: Record<COIN, number> = {
   ETH: 8,
   FDUSD: 6,
 };
+
+export const STABLE_COIN_TYPES = [
+  "USDC",
+  "wUSDT",
+  "BUCK",
+  "AUSD",
+  "FDUSD",
+] as const;
+
+export type STABLE_TYPES = (typeof STABLE_COIN_TYPES)[number];
