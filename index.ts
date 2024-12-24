@@ -121,8 +121,8 @@ async function openDexPosition() {
     1 / 4.3,
     1 / 4.9,
     0.7,
-    100 * 10 ** COIN_DECIMALS.wUSDT,
-    COIN_TYPE_LIST.wUSDT,
+    90 * 10 ** COIN_DECIMALS.USDC,
+    COIN_TYPE_LIST.USDC,
   );
 }
 

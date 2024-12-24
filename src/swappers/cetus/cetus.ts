@@ -197,6 +197,8 @@ export class CetusSwapper {
     poolObjectId: string,
     lowerPrice: number,
     upperPrice: number,
+    coinAmount: BigInt,
+    fix_amount_a: boolean,
   ) {
     // get Pool info
     const pool = await this.sdk.Pool.getPool(poolObjectId);
@@ -229,8 +231,6 @@ export class CetusSwapper {
     const lowerTick = isCorrectOrer ? lowerTick_ : upperTick_;
     const upperTick = isCorrectOrer ? upperTick_ : lowerTick_;
 
-    const coinAmount = new BN(1000 * 10 ** COIN_DECIMALS[coinA]);
-    const fix_amount_a = true;
     const slippage = 0.01;
     const curSqrtPrice = new BN(pool.current_sqrt_price);
 
@@ -238,7 +238,7 @@ export class CetusSwapper {
     const liquidityInput = ClmmPoolUtil.estLiquidityAndcoinAmountFromOneAmounts(
       lowerTick,
       upperTick,
-      coinAmount,
+      new BN(coinAmount.toString()),
       fix_amount_a,
       true,
       slippage,

@@ -173,10 +173,14 @@ export class SuilendBot {
       throw "Suilend not setup";
 
     // quote by 1000
+    const coinAmount = BigInt(1000 * 10 ** COIN_DECIMALS.USDC);
+    const fix_amount_a = true;
     const liquidityInfo = await this.swapper.quotePosition(
       poolObjectId,
       lowerPrice,
       upperPrice,
+      coinAmount,
+      fix_amount_a,
     );
     if (liquidityInfo.coinAmountA === 0 || liquidityInfo.coinAmountB === 0)
       throw "LP position leave range";
@@ -218,7 +222,7 @@ export class SuilendBot {
       requiredDepositUsd / (requiredDepositUsd + 1000);
 
     const amountInSuilend = Math.floor(depositedAmount * percentageInSuilend);
-    const amountForLP = depositedAmount - amountInSuilend;
+    const stableAmountForLP = depositedAmount - amountInSuilend;
 
     // prepare transaction
     const tx = new Transaction();
@@ -240,6 +244,14 @@ export class SuilendBot {
     logger.info(`deposit ${amountInSuilend} ${stableAssetSymbol}`);
 
     // 2. borrow on Suilend
+    const openedPositionLiquidityInfo = await this.swapper.quotePosition(
+      poolObjectId,
+      lowerPrice,
+      upperPrice,
+      BigInt(stableAmountForLP),
+      fix_amount_a,
+    );
+    const loanAmount = openedPositionLiquidityInfo.coinAmountB;
     const obligation = await this.suilend.getObligation(this.obligation.id);
     await this.refreshReservePrice(tx, [
       this.reserves[depositedStableCoinType],
@@ -250,9 +262,9 @@ export class SuilendBot {
       this.obligationOwnerCap.id,
       this.obligation.id,
       hedgedAssetType,
-      BigInt(hedgedAssetAmount),
+      BigInt(loanAmount),
     );
-    logger.info(`borrow ${hedgedAssetAmount} ${hedgedAssetSymbol}`);
+    logger.info(`borrow ${loanAmount} ${hedgedAssetSymbol}`);
 
     tx.transferObjects([loadnCoin], this.keypair.toSuiAddress());
     // 3. deposit LP
@@ -348,7 +360,6 @@ export class SuilendBot {
 
   async refreshReservePrice(tx: Transaction, reserves: ParsedReserve[]) {
     for (const reserve of reserves) {
-      logger.info({ reserve: reserve.priceIdentifier });
       const priceInfoObjectId =
         await this.suilend?.pythClient.getPriceFeedObjectId(
           reserve.priceIdentifier,
