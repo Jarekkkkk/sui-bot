@@ -5,6 +5,7 @@ import CetusClmmSDK, {
   ClmmPoolUtil,
   normalizeCoinType,
   Percentage,
+  printTransaction,
   type SdkOptions,
   TickMath,
   TransactionUtil,
@@ -310,34 +311,44 @@ export class CetusSwapper {
     const slippage = 0.01;
     const curSqrtPrice = new BN(pool.current_sqrt_price);
 
-    const liquidityInput = ClmmPoolUtil.estLiquidityAndcoinAmountFromOneAmounts(
-      lowerTick,
-      upperTick,
-      coinAmount,
-      fix_amount_a,
-      false,
-      slippage,
-      curSqrtPrice,
-    );
-    // const liquidityInput = ClmmPoolUtil.estimateLiquidityFromcoinAmounts(
-    //   new BN(pool.current_sqrt_price),
-    //   lowerTick,
-    //   upperTick,
-    //   {
-    //     coinA: coinAmount,
-    //     coinB: new BN(coinBAmount),
-    //   },
-    // );
-    //
-    logger.info({ liquidityInput });
+    const liquidityInputFixedByA =
+      ClmmPoolUtil.estLiquidityAndcoinAmountFromOneAmounts(
+        lowerTick,
+        upperTick,
+        coinAmount,
+        fix_amount_a,
+        true,
+        slippage,
+        curSqrtPrice,
+      );
+    const liquidityInputFixedByB =
+      ClmmPoolUtil.estLiquidityAndcoinAmountFromOneAmounts(
+        lowerTick,
+        upperTick,
+        new BN(coinBAmount),
+        !fix_amount_a,
+        true,
+        slippage,
+        curSqrtPrice,
+      );
+
+    const liquidityInput = liquidityInputFixedByA;
 
     logger.info({
-      coinAmountA: liquidityInput.toString(),
+      coinAmountA: liquidityInput.coinAmountA.toString(),
       coinAmountB: liquidityInput.coinAmountB.toString(),
       tokenMaxA: liquidityInput.tokenMaxA.toString(),
       tokenMaxB: liquidityInput.tokenMaxB.toString(),
       liquidityAmount: liquidityInput.liquidityAmount.toString(),
       fix_amount_a: liquidityInput.fix_amount_a,
+    });
+    logger.info({
+      coinAmountA: liquidityInputFixedByB.coinAmountA.toString(),
+      coinAmountB: liquidityInputFixedByB.coinAmountB.toString(),
+      tokenMaxA: liquidityInputFixedByB.tokenMaxA.toString(),
+      tokenMaxB: liquidityInputFixedByB.tokenMaxB.toString(),
+      liquidityAmount: liquidityInputFixedByB.liquidityAmount.toString(),
+      fix_amount_a: liquidityInputFixedByB.fix_amount_a,
     });
 
     if (
@@ -370,27 +381,22 @@ export class CetusSwapper {
       pos_id: "",
     };
 
-    // const addLiquidityPayloadParams: AddLiquidityParams = {
-    //   coinTypeA: pool.coinTypeA,
-    //   coinTypeB: pool.coinTypeB,
-    //   pool_id: pool.poolAddress,
-    //   tick_lower: lowerTick.toString(),
-    //   tick_upper: upperTick.toString(),
-    //   delta_liquidity: liquidity.toString(),
-    //   max_amount_a: tokenMaxA.toString(),
-    //   max_amount_b: tokenMaxB.toString(),
-    //   pos_id: position.pos_object_id,
-    //   rewarder_coin_types: [],
-    //   collect_fee: false,
-    // };
+    const createAddLiquidityTransactionPayload =
+      await this.sdk.Position.createAddLiquidityFixTokenPayload(
+        addLiquidityPayloadParams,
+        {
+          slippage: slippage,
+          curSqrtPrice: curSqrtPrice,
+        },
+      );
 
-    return await this.sdk.Position.createAddLiquidityFixTokenPayload(
-      addLiquidityPayloadParams,
-      {
-        slippage,
-        curSqrtPrice,
-      },
-    );
+    printTransaction(createAddLiquidityTransactionPayload);
+    return createAddLiquidityTransactionPayload;
+    // const transferTxn = await this.sdk.fullClient.sendTransaction(
+    //   this.keypair,
+    //   createAddLiquidityTransactionPayload,
+    // );
+    // console.log("open_and_add_liquidity_fix_token: ", transferTxn);
   }
 
   async closePosition(positionId: string) {

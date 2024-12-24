@@ -120,7 +120,7 @@ async function openDexPosition() {
     "0xb8d7d9e66a60c239e7a60110efcf8de6c705580ed924d0dde141f4a0e2c90105",
     1 / 4.3,
     1 / 4.9,
-    0.7,
+    0.5,
     90 * 10 ** COIN_DECIMALS.USDC,
     COIN_TYPE_LIST.USDC,
   );

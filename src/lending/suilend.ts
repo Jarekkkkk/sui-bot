@@ -29,7 +29,10 @@ import {
   Transaction,
   type TransactionObjectInput,
 } from "@mysten/sui/transactions";
-import { obligationId } from "@suilend/sdk/_generated/suilend/lending-market/functions";
+import {
+  obligationId,
+  reserve,
+} from "@suilend/sdk/_generated/suilend/lending-market/functions";
 import { Obligation } from "@suilend/sdk/_generated/suilend/obligation/structs";
 import type { COIN, SuilendObligation } from "../../type";
 import type { CetusSwapper } from "../swappers/cetus";
@@ -216,7 +219,7 @@ export class SuilendBot {
     if (!price) throw `Failed to fetch price for ${hedgedAssetSymbol}`;
     const hedgedAssetUsd = price.toNumber() * hedgedAssetAmount_;
 
-    const requiredDepositUsd = hedgedAssetUsd / 0.7;
+    const requiredDepositUsd = hedgedAssetUsd / percentage;
 
     const percentageInSuilend =
       requiredDepositUsd / (requiredDepositUsd + 1000);
@@ -224,26 +227,29 @@ export class SuilendBot {
     const amountInSuilend = Math.floor(depositedAmount * percentageInSuilend);
     const stableAmountForLP = depositedAmount - amountInSuilend;
 
-    // prepare transaction
-    const tx = new Transaction();
-    // 1. deposit on Suilend
-    const inputCoin = await getInputCoins(
-      tx,
-      this.suiClient,
-      this.keypair.toSuiAddress(),
-      depositedStableCoinType,
-      amountInSuilend.toString(),
-    );
-    this.deposit_(
-      tx,
-      tx.object(this.obligationOwnerCap.id),
-      inputCoin,
-      depositedStableCoinType,
-    );
-
-    logger.info(`deposit ${amountInSuilend} ${stableAssetSymbol}`);
-
-    // 2. borrow on Suilend
+    // {
+    //   // prepare transaction
+    //   const tx = new Transaction();
+    //   // 1. deposit on Suilend
+    //   const inputCoin = await getInputCoins(
+    //     tx,
+    //     this.suiClient,
+    //     this.keypair.toSuiAddress(),
+    //     depositedStableCoinType,
+    //     amountInSuilend.toString(),
+    //   );
+    //   this.deposit_(
+    //     tx,
+    //     tx.object(this.obligationOwnerCap.id),
+    //     inputCoin,
+    //     depositedStableCoinType,
+    //   );
+    //
+    //   logger.info(
+    //     `deposit ${amountInSuilend / 10 ** COIN_DECIMALS[stableAssetSymbol as COIN]} ${stableAssetSymbol}`,
+    //   );
+    //
+    //   // 2. borrow on Suilend
     const openedPositionLiquidityInfo = await this.swapper.quotePosition(
       poolObjectId,
       lowerPrice,
@@ -252,34 +258,47 @@ export class SuilendBot {
       fix_amount_a,
     );
     const loanAmount = openedPositionLiquidityInfo.coinAmountB;
-    const obligation = await this.suilend.getObligation(this.obligation.id);
-    await this.refreshReservePrice(tx, [
-      this.reserves[depositedStableCoinType],
-      this.reserves[hedgedAssetType],
-    ]);
-    const loadnCoin = await this.borrow_(
-      tx,
-      this.obligationOwnerCap.id,
-      this.obligation.id,
-      hedgedAssetType,
-      BigInt(loanAmount),
-    );
-    logger.info(`borrow ${loanAmount} ${hedgedAssetSymbol}`);
-
-    tx.transferObjects([loadnCoin], this.keypair.toSuiAddress());
-    // 3. deposit LP
+    //   const obligation = await this.suilend.getObligation(this.obligation.id);
+    //   await this.refreshReservePrice(tx, [
+    //     this.reserves[depositedStableCoinType],
+    //     this.reserves[hedgedAssetType],
+    //   ]);
+    //   const loadnCoin = await this.borrow_(
+    //     tx,
+    //     this.obligationOwnerCap.id,
+    //     this.obligation.id,
+    //     hedgedAssetType,
+    //     BigInt(loanAmount),
+    //   );
+    //   logger.info(
+    //     `borrow ${loanAmount / 10 ** COIN_DECIMALS[hedgedAssetSymbol as COIN]} ${hedgedAssetSymbol}`,
+    //   );
+    //
+    //   tx.transferObjects([loadnCoin], this.keypair.toSuiAddress());
+    //   // 3. deposit LP
+    //
+    //   const devResponse = await this.dryRun(tx);
+    //   if (devResponse.effects.status.status === "failure")
+    //     throw "dryRun failed at borrowing from Suilend";
+    //   const response = await this.executeTransaction(tx);
+    //   if (response.effects?.status.status === "failure")
+    //     throw "transaction execution failed at borrowing from Suilend";
+    // }
 
     // TODO: distinguish whether is stable assets
-    // this.swapper.createPosition(
-    //   poolObjectId,
-    //   lowerPrice,
-    //   upperPrice,
-    //   stableAssetAmount,
-    //   hedgedAssetAmount,
-    // );
+    const txWithLPOpenedPosition = await this.swapper.createPosition(
+      poolObjectId,
+      lowerPrice,
+      upperPrice,
+      stableAmountForLP,
+      loanAmount,
+    );
 
-    const devResponse = await this.dryRun(tx);
-    logger.info({ devResponse: tx.blockData.transactions });
+    txWithLPOpenedPosition.setSender(this.keypair.toSuiAddress());
+    await this.executeTransaction(txWithLPOpenedPosition);
+
+    // const devResponse_ = await this.dryRun(txWithLPOpenedPosition);
+    // logger.debug({ devResponse: devResponse_ });
   }
 
   async run() {
