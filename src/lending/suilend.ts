@@ -22,7 +22,7 @@ import {
 } from "@suilend/sdk/_generated/suilend/lending-market/structs";
 import { phantom } from "@suilend/sdk/_generated/_framework/reified";
 import { getCoinMetadataMap, getInputCoins } from "../lib";
-import { normalizeStructTag, SUI_TYPE_ARG } from "@mysten/sui/utils";
+import { normalizeStructTag, SUI_TYPE_ARG, toHex } from "@mysten/sui/utils";
 import { borrowLimit } from "@suilend/sdk/_generated/suilend/reserve-config/functions";
 import { COIN_DECIMALS, COIN_TYPE_LIST, STABLE_COIN_TYPES } from "../const";
 import {
@@ -30,9 +30,10 @@ import {
   type TransactionObjectInput,
 } from "@mysten/sui/transactions";
 import { obligationId } from "@suilend/sdk/_generated/suilend/lending-market/functions";
-import type { Obligation } from "@suilend/sdk/_generated/suilend/obligation/structs";
-import type { SuilendObligation } from "../../type";
+import { Obligation } from "@suilend/sdk/_generated/suilend/obligation/structs";
+import type { COIN, SuilendObligation } from "../../type";
 import type { CetusSwapper } from "../swappers/cetus";
+import type { Reserve } from "@suilend/sdk/_generated/suilend/reserve/structs";
 
 export type SuilendBotConfig = {
   keypair: Ed25519Keypair | Secp256k1Keypair;
@@ -55,7 +56,8 @@ export class SuilendBot {
   pythConnection: SuiPriceServiceConnection;
   statsd: StatsD;
   obligationOwnerCap?: ObligationOwnerCap<string>;
-  obligation?: SuilendObligation | null;
+  obligation?: SuilendObligation;
+  reserves?: Record<string, ParsedReserve>;
 
   constructor(config: SuilendBotConfig) {
     this.config = config;
@@ -69,6 +71,8 @@ export class SuilendBot {
   }
 
   async setup() {
+    this.swapper.init();
+
     this.suilend = await SuilendClient.initialize(
       this.config.marketAddress,
       this.config.lendingMarketType,
@@ -117,6 +121,7 @@ export class SuilendBot {
       (acc, reserve) => ({ ...acc, [reserve.coinType]: reserve }),
       {},
     ) as Record<string, ParsedReserve>;
+    this.reserves = reserveMap;
 
     // personal obligations
     // - get all obligationIds
@@ -150,35 +155,141 @@ export class SuilendBot {
     this.obligation = obligations[0];
   }
 
+  async openHedgedPosition(
+    poolObjectId: string,
+    lowerPrice: number,
+    upperPrice: number,
+    percentage: number,
+    depositedAmount: number,
+    depositedStableCoinType: string,
+  ) {
+    await this.setup();
+    if (
+      !this.suilend ||
+      !this.obligationOwnerCap ||
+      !this.obligation ||
+      !this.reserves
+    )
+      throw "Suilend not setup";
+
+    // quote by 1000
+    const liquidityInfo = await this.swapper.quotePosition(
+      poolObjectId,
+      lowerPrice,
+      upperPrice,
+    );
+    if (liquidityInfo.coinAmountA === 0 || liquidityInfo.coinAmountB === 0)
+      throw "LP position leave range";
+
+    const {
+      hedgedAssetType,
+      hedgedAssetSymbol,
+      hedgedAssetAmount,
+      stableAssetType,
+      stableAssetSymbol,
+      stableAssetAmount,
+    } = this.parseLiquidityInfo({
+      coinA: liquidityInfo.coinA,
+      coinB: liquidityInfo.coinB,
+      coinAAmount: liquidityInfo.coinAmountA,
+      coinBAmount: liquidityInfo.coinAmountB,
+    });
+
+    const hedgedAssetAmount_ =
+      hedgedAssetAmount / 10 ** COIN_DECIMALS[hedgedAssetSymbol as COIN];
+    const stableAssetAmount_ =
+      stableAssetAmount / 10 ** COIN_DECIMALS[stableAssetSymbol as COIN];
+
+    logger.info({
+      hedgedAssetType,
+      hedgedAssetSymbol,
+      hedgedAssetAmount: hedgedAssetAmount_,
+      stableAssetSymbol,
+      stableAssetAmount: stableAssetAmount_,
+    });
+
+    const price = this.reserves?.[hedgedAssetType].price;
+    if (!price) throw `Failed to fetch price for ${hedgedAssetSymbol}`;
+    const hedgedAssetUsd = price.toNumber() * hedgedAssetAmount_;
+
+    const requiredDepositUsd = hedgedAssetUsd / 0.7;
+
+    const percentageInSuilend =
+      requiredDepositUsd / (requiredDepositUsd + 1000);
+
+    const amountInSuilend = Math.floor(depositedAmount * percentageInSuilend);
+    const amountForLP = depositedAmount - amountInSuilend;
+
+    // prepare transaction
+    const tx = new Transaction();
+    // 1. deposit on Suilend
+    const inputCoin = await getInputCoins(
+      tx,
+      this.suiClient,
+      this.keypair.toSuiAddress(),
+      depositedStableCoinType,
+      amountInSuilend.toString(),
+    );
+    this.deposit_(
+      tx,
+      tx.object(this.obligationOwnerCap.id),
+      inputCoin,
+      depositedStableCoinType,
+    );
+
+    logger.info(`deposit ${amountInSuilend} ${stableAssetSymbol}`);
+
+    // 2. borrow on Suilend
+    const obligation = await this.suilend.getObligation(this.obligation.id);
+    await this.refreshReservePrice(tx, [
+      this.reserves[depositedStableCoinType],
+      this.reserves[hedgedAssetType],
+    ]);
+    const loadnCoin = await this.borrow_(
+      tx,
+      this.obligationOwnerCap.id,
+      this.obligation.id,
+      hedgedAssetType,
+      BigInt(hedgedAssetAmount),
+    );
+    logger.info(`borrow ${hedgedAssetAmount} ${hedgedAssetSymbol}`);
+
+    tx.transferObjects([loadnCoin], this.keypair.toSuiAddress());
+    // 3. deposit LP
+
+    // TODO: distinguish whether is stable assets
+    // this.swapper.createPosition(
+    //   poolObjectId,
+    //   lowerPrice,
+    //   upperPrice,
+    //   stableAssetAmount,
+    //   hedgedAssetAmount,
+    // );
+
+    const devResponse = await this.dryRun(tx);
+    logger.info({ devResponse: tx.blockData.transactions });
+  }
+
   async run() {
     await this.setup();
-    if (!this.suilend || !this.obligationOwnerCap || !this.obligation)
+    if (
+      !this.suilend ||
+      !this.obligationOwnerCap ||
+      !this.obligation ||
+      !this.reserves
+    )
       throw "Suilend not setup";
 
     const liquidityInfo = await this.swapper.fetchLPPositions(
       "0x30b7881f9b24d9ed2507604d911dd73e430462d6eafb0918f061fc65551ffefe",
     );
 
-    if (
-      liquidityInfo.coinAAmount === "0" ||
-      liquidityInfo.coinBAmount === "0"
-    ) {
+    if (liquidityInfo.coinAAmount === 0 || liquidityInfo.coinBAmount === 0) {
       throw "LP position leave range";
       // TODO: repay all the assets in suilend to offset the debt
     } else {
-      const isCoinAStable = STABLE_COIN_TYPES.includes(
-        liquidityInfo.coinA as any,
-      );
-      const isCoinBStable = STABLE_COIN_TYPES.includes(
-        liquidityInfo.coinB as any,
-      );
-
-      if (!isCoinAStable && !isCoinBStable) throw "Unsupported LP position";
-      if (isCoinAStable && isCoinBStable) throw "Stable LP position";
-
-      const hedgedAssetType = isCoinAStable
-        ? liquidityInfo.coinB
-        : liquidityInfo.coinA;
+      const { hedgedAssetType, hedgedAssetSymbol, hedgedAssetAmount } =
+        this.parseLiquidityInfo(liquidityInfo);
 
       // parse obligation
       const deposits = this.obligation.deposits.map((deposit) => ({
@@ -202,7 +313,93 @@ export class SuilendBot {
         liquidationThresholdUsd,
         borrowLimitUsd,
       });
+
+      // obligation validation
+      if (
+        this.obligation.maxPriceWeightedBorrowsUsd >
+        this.obligation.minPriceBorrowLimitUsd
+      )
+        throw "Unhealthy obligation";
+
+      const hedgedAssetReserve = this.reserves[hedgedAssetType];
+
+      const borrowFee = hedgedAssetReserve.config.borrowFeeBps / 10000;
+      const maxBorrowAmount = this.obligation.minPriceBorrowLimitUsd
+        .minus(this.obligation.maxPriceWeightedBorrowsUsd)
+        .div(
+          hedgedAssetReserve.maxPrice.times(
+            hedgedAssetReserve.config.borrowWeightBps / 10000,
+          ),
+        )
+        .div(1 + borrowFee);
+
+      logger.info({ maxBorrowAmount: maxBorrowAmount.toNumber() });
+
+      const obligationLoanAmount = borrows.find(
+        (borrow) => borrow.coinType == hedgedAssetType,
+      );
+
+      if (!obligationLoanAmount) throw `No loan for ${hedgedAssetType}`;
+
+      logger.info({ borrows });
+      logger.info({ obligationLoanAmount });
     }
+  }
+
+  async refreshReservePrice(tx: Transaction, reserves: ParsedReserve[]) {
+    for (const reserve of reserves) {
+      logger.info({ reserve: reserve.priceIdentifier });
+      const priceInfoObjectId =
+        await this.suilend?.pythClient.getPriceFeedObjectId(
+          reserve.priceIdentifier,
+        );
+
+      if (!priceInfoObjectId)
+        throw `priceIdentifier object not found for ${reserve.coinType}`;
+      await this.suilend?.refreshReservePrices(
+        tx,
+        priceInfoObjectId,
+        reserve.arrayIndex,
+      );
+    }
+  }
+
+  parseLiquidityInfo(liquidityInfo: {
+    coinA: string;
+    coinB: string;
+    coinAAmount: number;
+    coinBAmount: number;
+  }) {
+    const isCoinAStable = STABLE_COIN_TYPES.includes(
+      liquidityInfo.coinA as any,
+    );
+    const isCoinBStable = STABLE_COIN_TYPES.includes(
+      liquidityInfo.coinB as any,
+    );
+
+    if (!isCoinAStable && !isCoinBStable) throw "Unsupported LP position";
+    if (isCoinAStable && isCoinBStable) throw "Stable LP position";
+
+    const symbols = isCoinAStable
+      ? [liquidityInfo.coinB, liquidityInfo.coinA]
+      : [liquidityInfo.coinA, liquidityInfo.coinB];
+    const amounts = isCoinAStable
+      ? [liquidityInfo.coinBAmount, liquidityInfo.coinAAmount]
+      : [liquidityInfo.coinAAmount, liquidityInfo.coinBAmount];
+    const hedgedAssetType = normalizeStructTag(
+      COIN_TYPE_LIST[symbols[0] as COIN],
+    );
+    const hedgedAssetAmount = Number(
+      isCoinAStable ? liquidityInfo.coinBAmount : liquidityInfo.coinAAmount,
+    );
+    return {
+      hedgedAssetSymbol: symbols[0],
+      hedgedAssetType: normalizeStructTag(COIN_TYPE_LIST[symbols[0] as COIN]),
+      hedgedAssetAmount: amounts[0],
+      stableAssetSymbol: symbols[1],
+      stableAssetType: normalizeStructTag(COIN_TYPE_LIST[symbols[1] as COIN]),
+      stableAssetAmount: amounts[1],
+    };
   }
 
   // PTB
@@ -223,7 +420,8 @@ export class SuilendBot {
     coinType: string,
     value: BigInt,
   ) {
-    if (!this.suilend) throw "Suilend client not setup";
+    if (!this.suilend || !this.obligation) throw "Suilend client not setup";
+
     return await this.suilend.borrow(
       obligationOwnerCapId,
       obligationId,

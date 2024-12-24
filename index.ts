@@ -12,7 +12,7 @@ import {
   MAINNET_CETUS_SDK_CONFIG,
   MAINNET_POOL_INFO_URL,
 } from "./src/swappers/cetus";
-import { COIN_TYPE_LIST } from "./src/const";
+import { COIN_DECIMALS, COIN_TYPE_LIST } from "./src/const";
 import { Transaction } from "@mysten/sui/transactions";
 
 dotenv.config();
@@ -27,6 +27,9 @@ program.command("open-dex-position").action(async () => {
 });
 program.command("close-dex-position").action(async () => {
   await closeDexPosition();
+});
+program.command("swap").action(async () => {
+  await swap();
 });
 
 // create keypair
@@ -70,7 +73,7 @@ async function runSuilendBot() {
     swapper: swapper,
   });
 
-  await bot.run();
+  // await bot.run();
 
   // await swapper.fetchLPPositions(
   //   "0x30b7881f9b24d9ed2507604d911dd73e430462d6eafb0918f061fc65551ffefe",
@@ -102,8 +105,6 @@ async function openDexPosition() {
     rpcURL: "https://fullnode.mainnet.sui.io/",
   });
 
-  await swapper.init();
-
   const bot = new SuilendBot({
     keypair,
     lendingMarketType: LENDING_MARKET_TYPE,
@@ -115,19 +116,14 @@ async function openDexPosition() {
     swapper: swapper,
   });
 
-  const tx = await swapper.createPosition(
+  await bot.openHedgedPosition(
     "0xb8d7d9e66a60c239e7a60110efcf8de6c705580ed924d0dde141f4a0e2c90105",
-    1 / 4.2,
-    1 / 4.7,
-    1000, // amount A
+    1 / 4.3,
+    1 / 4.9,
+    0.7,
+    100 * 10 ** COIN_DECIMALS.wUSDT,
+    COIN_TYPE_LIST.wUSDT,
   );
-  if (!tx) throw "Failed to build the tx";
-  const devRes = await bot.dryRun(tx);
-  logger.debug({ devRes });
-  // if (devRes.effects.status.status === "success") {
-  //   const transactionResult = await bot.executeTransaction(tx);
-  //   logger.info({ transactionResult });
-  // }
 }
 
 async function closeDexPosition() {
@@ -165,6 +161,43 @@ async function closeDexPosition() {
     const transactionResult = await bot.executeTransaction(tx);
     logger.info({ transactionResult });
   }
+}
+
+async function swap() {
+  const keypair = createSigner();
+  logger.info(keypair.toSuiAddress());
+
+  const sdkConfig = MAINNET_CETUS_SDK_CONFIG;
+  const swapper = new CetusSwapper({
+    keypair: keypair as any,
+    poolInfoURL: MAINNET_POOL_INFO_URL,
+    sdkOptions: sdkConfig,
+    rpcURL: "https://fullnode.mainnet.sui.io/",
+  });
+
+  const bot = new SuilendBot({
+    keypair,
+    lendingMarketType: LENDING_MARKET_TYPE,
+    pollingIntervalSeconds: 15,
+    refetchIntervalSeconds: 60 * 30,
+    marketAddress: LENDING_MARKET_ID,
+    rpcURL: "https://fullnode.mainnet.sui.io/",
+    statsd: new StatsD({ mock: true }),
+    swapper: swapper,
+  });
+
+  swapper.init();
+
+  const tx = await swapper.swap({
+    fromCoinType: COIN_TYPE_LIST.USDC,
+    toCoinType: COIN_TYPE_LIST.wUSDT,
+    fromAmount: 11020,
+    maxSlippage: 0.001,
+  });
+
+  if (!tx) throw "No tx";
+  const res = await bot.executeTransaction(tx);
+  logger.info({ res });
 }
 
 program.parse();
