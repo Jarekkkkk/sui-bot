@@ -301,7 +301,7 @@ export class SuilendBot {
     // logger.debug({ devResponse: devResponse_ });
   }
 
-  async run() {
+  async run(positionId: string) {
     await this.setup();
     if (
       !this.suilend ||
@@ -311,16 +311,20 @@ export class SuilendBot {
     )
       throw "Suilend not setup";
 
-    const liquidityInfo = await this.swapper.fetchLPPositions(
-      "0x30b7881f9b24d9ed2507604d911dd73e430462d6eafb0918f061fc65551ffefe",
-    );
+    const liquidityInfo = await this.swapper.fetchLPPositions(positionId);
 
     if (liquidityInfo.coinAAmount === 0 || liquidityInfo.coinBAmount === 0) {
       throw "LP position leave range";
       // TODO: repay all the assets in suilend to offset the debt
     } else {
-      const { hedgedAssetType, hedgedAssetSymbol, hedgedAssetAmount } =
-        this.parseLiquidityInfo(liquidityInfo);
+      const {
+        hedgedAssetType,
+        hedgedAssetSymbol,
+        hedgedAssetAmount,
+        stableAssetSymbol,
+        stableAssetType,
+        stableAssetAmount,
+      } = this.parseLiquidityInfo(liquidityInfo);
 
       // parse obligation
       const deposits = this.obligation.deposits.map((deposit) => ({
@@ -372,8 +376,103 @@ export class SuilendBot {
 
       if (!obligationLoanAmount) throw `No loan for ${hedgedAssetType}`;
 
-      logger.info({ borrows });
-      logger.info({ obligationLoanAmount });
+      const formatHedgedAmount =
+        hedgedAssetAmount / 10 ** COIN_DECIMALS[hedgedAssetSymbol as COIN];
+      logger.info({
+        hedgedAssetAmount: formatHedgedAmount,
+        hedgedAssetSymbol,
+        obligationLoanAmount,
+      });
+
+      const diff = obligationLoanAmount.amount - formatHedgedAmount;
+
+      const maxSlippage = 0.005;
+      const tx = new Transaction();
+      if (diff > 0) {
+        //over-hedged: swap stable assets for repaying the loan
+        logger.info(
+          `${Math.abs(diff)} ${hedgedAssetSymbol} needs to be repaied`,
+        );
+        const repaidAmount = Math.floor(
+          diff * 10 ** COIN_DECIMALS[hedgedAssetSymbol as COIN],
+        );
+        const quote = await this.swapper.quoteRouter({
+          fromCoinType: stableAssetType,
+          toCoinType: hedgedAssetType,
+          toAmount: repaidAmount,
+          maxSlippage,
+        });
+        if (!quote) throw "Failed to find the quote";
+        await this.refreshReservePrice(tx, [
+          this.reserves[stableAssetType],
+          this.reserves[hedgedAssetType],
+        ]);
+
+        const swappedCoin = await this.withdraw_(
+          tx,
+          this.obligationOwnerCap.id,
+          this.obligation.id,
+          stableAssetType,
+          quote.amountIn.toString(),
+        );
+
+        const outputCoin = await this.swapper.swap_(
+          tx,
+          swappedCoin,
+          quote,
+          false,
+          maxSlippage,
+        );
+        this.repay(tx, this.obligation.id, hedgedAssetType, outputCoin);
+        tx.transferObjects([outputCoin], this.keypair.toSuiAddress());
+      } else {
+        //require-hedged: borrow more loan and swap for stablecoin then deposit back to Suilend
+        logger.info(
+          `${Math.abs(diff)} ${hedgedAssetSymbol} needs to be hedged`,
+        );
+        const loanAmount = Math.floor(
+          Math.abs(diff) * 10 ** COIN_DECIMALS[hedgedAssetSymbol as COIN],
+        );
+        const quote = await this.swapper.quoteRouter({
+          fromCoinType: hedgedAssetType,
+          toCoinType: stableAssetType,
+          fromAmount: loanAmount,
+          maxSlippage,
+        });
+        if (!quote) throw "Failed to find the quote";
+        const obligation = await this.suilend.getObligation(this.obligation.id);
+        await this.refreshReservePrice(tx, [
+          this.reserves[stableAssetType],
+          this.reserves[hedgedAssetType],
+        ]);
+        const loanCoin = await this.borrow_(
+          tx,
+          this.obligationOwnerCap.id,
+          this.obligation.id,
+          hedgedAssetType,
+          BigInt(loanAmount),
+        );
+        const outputCoin = await this.swapper.swap_(
+          tx,
+          loanCoin,
+          quote,
+          true,
+          maxSlippage,
+        );
+
+        this.deposit_(
+          tx,
+          tx.object(this.obligationOwnerCap.id),
+          outputCoin,
+          stableAssetType,
+        );
+      }
+      const devResponse = await this.dryRun(tx);
+      if (devResponse.effects.status.status === "failure")
+        throw "Dry run failed at rebalancing";
+
+      const response = await this.executeTransaction(tx);
+      logger.info({ response });
     }
   }
 
@@ -443,6 +542,23 @@ export class SuilendBot {
     this.suilend.deposit(coin, coinType, obligation, tx);
   }
 
+  async withdraw_(
+    tx: Transaction,
+    obligationOwnerCapId: string,
+    obligationId: string,
+    coinType: string,
+    value: string,
+  ) {
+    if (!this.suilend) throw "Suilend client not setup";
+    return await this.suilend.withdraw(
+      obligationOwnerCapId,
+      obligationId,
+      coinType,
+      value,
+      tx,
+    );
+  }
+
   async borrow_(
     tx: Transaction,
     obligationOwnerCapId: string,
@@ -459,6 +575,17 @@ export class SuilendBot {
       value.toString(),
       tx,
     );
+  }
+
+  repay(
+    tx: Transaction,
+    obligationId: string,
+    coinType: string,
+    coin: TransactionObjectInput,
+  ) {
+    if (!this.suilend || !this.obligation) throw "Suilend client not setup";
+
+    this.suilend.repay(obligationId, coinType, coin, tx);
   }
 
   async dryRun(tx: Transaction) {

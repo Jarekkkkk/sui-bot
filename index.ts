@@ -14,6 +14,7 @@ import {
 } from "./src/swappers/cetus";
 import { COIN_DECIMALS, COIN_TYPE_LIST } from "./src/const";
 import { Transaction } from "@mysten/sui/transactions";
+import { CronJob } from "cron";
 
 dotenv.config();
 
@@ -73,7 +74,9 @@ async function runSuilendBot() {
     swapper: swapper,
   });
 
-  // await bot.run();
+  await bot.run(
+    "0x06c0f1bbb36b8d145fe66a8f17759c6defb9d0a3de45900f71d26272d940e402",
+  );
 
   // await swapper.fetchLPPositions(
   //   "0x30b7881f9b24d9ed2507604d911dd73e430462d6eafb0918f061fc65551ffefe",
@@ -200,4 +203,15 @@ async function swap() {
   logger.info({ res });
 }
 
-program.parse();
+const job = new CronJob("*/5 * * * *", async function () {
+  try {
+    await runSuilendBot();
+  } catch (error) {
+    logger.error(error);
+  } finally {
+    logger.info("Finish");
+  }
+});
+
+job.start();
+// program.parse();
